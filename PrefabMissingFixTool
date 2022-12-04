@@ -1,0 +1,582 @@
+using Newtonsoft.Json;
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.EventSystems;
+using UnityEngine.UI;
+using Object = UnityEngine.Object;
+
+public static class PrefabMissingTool
+{
+    private struct CharacteristicInfo
+    {
+        public string Characteristic { get; set; }
+        public Type Type { get; set; }
+
+        public CharacteristicInfo(string c, Type t)
+        {
+            Characteristic = c;
+            Type = t;
+        }
+    }
+
+    private class FileTypeGUID
+    {
+        public Type Type { get; set; }
+        public long FileId { get; set; }
+        public string Guid { get; set; }
+        public int FileType { get; set; }
+
+        public FileTypeGUID(Type type, long fileId, string guid, int fileType)
+        {
+            Type = type;
+            FileId = fileId;
+            Guid = guid;
+            FileType = fileType;
+        }
+
+        public override string ToString()
+        {
+            return $"Type:{Type.Name}, FileId:{FileId}, Guid:{Guid}, FileType:{FileType}";
+        }
+    }
+
+    delegate bool TryGetFileGUITypeDelegate(PrefabChunk chunk, out FileTypeGUID fileTypeGUID);
+    delegate bool IsConfusingTypeDelegate(PrefabChunk chunk, out FileTypeGUID[] confusingGUIDs);
+
+    private class PrefabContent
+    {
+        public Object Object { get; private set; }
+        private readonly List<PrefabChunk> _chunks = new List<PrefabChunk>();
+        private readonly List<string> _head = new List<string>();
+        private readonly Dictionary<long, string> _gameObjects = new Dictionary<long, string>();
+
+        private PrefabContent(Object belonging)
+        {
+            Object = belonging;
+        }
+
+        public void Analysis(TryGetFileGUITypeDelegate tryGetHandler, IsConfusingTypeDelegate isConfusingTypeHandler)
+        {
+            var changeCount = 0;
+            FileTypeGUID[] fileTypeGUIDs;
+            foreach (var chunk in _chunks)
+            {
+                if (tryGetHandler.Invoke(chunk, out var item))
+                {
+                    if (isConfusingTypeHandler.Invoke(chunk, out fileTypeGUIDs))
+                    {
+                        Debug.LogError("=========== confusing warning ===========");
+                        Debug.LogError($"chunk.Component is a confusing type, should confirm again, {chunk.PrefabContent.Object}", chunk.PrefabContent.Object);
+                        foreach (var guid in fileTypeGUIDs)
+                        {
+                            Debug.LogError($"Type:{guid.Type}, FileID:{guid.FileId}, guid:{guid.Guid}, type:{guid.FileType}");
+                        }
+                        Debug.LogError("=========== end ===========");
+                    }
+                    if (chunk.ModifyM_Script(item.FileId, item.Guid, item.FileType))
+                    {
+                        changeCount++;
+                    }
+                }
+            }
+            Debug.Log($"修改了 {changeCount} 个组件");
+        }
+
+        public string[] GetLines()
+        {
+            var list = new List<string>();
+            list.AddRange(_head);
+            foreach (var chunk in _chunks)
+            {
+                list.AddRange(chunk.Lines);
+            }
+            return list.ToArray();
+        }
+
+        public string GetName(long id)
+        {
+            _gameObjects.TryGetValue(id, out var name);
+            return name;
+        }
+
+        public static PrefabContent Parse(Object selected, string[] lines, CharacteristicInfo[] characteristics)
+        {
+            var count = lines.Length;
+            var listInChunk = new List<string>();
+            var content = new PrefabContent(selected);
+            var id = 0L;
+            var foundGameObjectTag = false;
+            for (int i = 0; i < count; i++)
+            {
+                var line = lines[i];
+                if (line.StartsWith("%"))
+                {
+                    content._head.Add(line);
+                    continue;
+                }
+                if (line.StartsWith("---"))
+                {
+                    if (i + 1 < count && lines[i + 1].StartsWith("GameObject:"))
+                    {
+                        var andIndex = line.IndexOf('&');
+                        var idString = line.Substring(andIndex + 1);
+                        long.TryParse(idString, out id);
+                        foundGameObjectTag = true;
+                    }
+
+                    if (listInChunk.Count != 0)
+                    {
+                        var chunk = new PrefabChunk(content, listInChunk.ToArray(), characteristics);
+
+                        content._chunks.Add(chunk);
+                        listInChunk.Clear();
+                    }
+                    listInChunk.Add(line);
+                    continue;
+                }
+                if (foundGameObjectTag)
+                {
+                    var nameTag = "m_Name:";
+                    var nameIndex = line.IndexOf(nameTag);
+                    if (!string.IsNullOrEmpty(line) && nameIndex != -1)
+                    {
+                        var name = line.Substring(nameIndex + nameTag.Length).Trim();
+                        content._gameObjects[id] = name;
+                        foundGameObjectTag = false;
+                    }
+                }
+                listInChunk.Add(line);
+            }
+            // 添加剩余的
+            if (listInChunk.Count != 0)
+            {
+                var chunk = new PrefabChunk(content, listInChunk.ToArray(), characteristics);
+                content._chunks.Add(chunk);
+                listInChunk.Clear();
+            }
+            return content;
+        }
+    }
+
+    private class PrefabChunk
+    {
+        private const string ScriptFormat = "  m_Script: {fileID: #FILEID#, guid: #GUID#, type: #TYPE#}";
+
+        public string Name { get; private set; }
+        public PrefabContent PrefabContent { get; private set; }
+        public Type ComponentType { get; private set; }
+        public string[] Lines { get; private set; }
+
+        public long FileID { get { return _fileID; } }
+        private long _fileID;
+
+        public string GUID { get { return _guid; } }
+        private string _guid;
+
+        public int Type { get { return _type; } }
+        private int _type;
+
+        private int _index;
+
+        public PrefabChunk(PrefabContent content, string[] lines, CharacteristicInfo[] characteristics)
+        {
+            PrefabContent = content;
+            Lines = lines;
+            FindName();
+            FindType(characteristics);
+            FindScriptLine();
+        }
+
+        private void FindName()
+        {
+            var line = FindLine("m_GameObject:", out var gameObjectIndex);
+            if (string.IsNullOrEmpty(line) && gameObjectIndex == -1)
+            {
+                return;
+            }
+            var gameObjectContent = line.Substring(gameObjectIndex);
+            if (string.IsNullOrEmpty(gameObjectContent))
+            {
+                return;
+            }
+            gameObjectContent = gameObjectContent.Trim().Trim('{').Trim('}');
+            var filedIDTag = "fileID:";
+            var fileIDIndex = gameObjectContent.IndexOf(filedIDTag);
+            if (fileIDIndex == -1)
+            {
+                return;
+            }
+            var idString = gameObjectContent.Substring(fileIDIndex + filedIDTag.Length);
+            long.TryParse(idString, out var id);
+            if (id == 0)
+            {
+                return;
+            }
+            Name = PrefabContent.GetName(id);
+        }
+
+        private void FindType(CharacteristicInfo[] characteristics)
+        {
+            foreach (var pair in characteristics)
+            {
+                if (FindCharacteristic(pair.Characteristic))
+                {
+                    ComponentType = pair.Type;
+                }
+            }
+        }
+
+        private void FindScriptLine()
+        {
+            _index = -1;
+            var count = Lines.Length;
+            for (int i = 0; i < count; i++)
+            {
+                if (Lines[i].Contains("m_Script"))
+                {
+                    _index = i;
+                    break;
+                }
+            }
+            if (_index == -1)
+            {
+                return;
+            }
+            AnalysisScriptLine(Lines[_index], out _fileID, out _guid, out _type);
+        }
+
+        public string FindLine(string tag, out int index)
+        {
+            index = -1;
+            foreach (var line in Lines)
+            {
+                index = line.IndexOf(tag);
+                if (index != -1)
+                {
+                    index += tag.Length;
+                    return line;
+                }
+            }
+            return string.Empty;
+        }
+
+        private bool FindCharacteristic(string tags)
+        {
+            var tagArr = tags.Split('&');
+            var tagCount = tagArr.Length;
+            var count = Lines.Length;
+            var matchCount = 0;
+            for (int tagIndex = 0; tagIndex < tagCount; tagIndex++)
+            {
+                var tag = tagArr[tagIndex];
+                for (int i = 0; i < count; i++)
+                {
+                    var line = Lines[i];
+                    if (line.Contains(tag))
+                    {
+                        matchCount++;
+                    }
+                }
+            }
+            return matchCount == tagCount;
+        }
+
+        public bool ModifyM_Script(long fileId, string guid, int type)
+        {
+            if (_index == -1)
+            {
+                return false;
+            }
+            if (_fileID == fileId && _guid == guid && _type == type)
+            {
+                Debug.Log($"{Name} is using correct reference, needn't to fix");
+                return false;
+            }
+            var line = ScriptFormat.Replace("#FILEID#", fileId.ToString()).Replace("#GUID#", guid).Replace("#TYPE#", type.ToString());
+            Debug.Log($"{Name}:{ComponentType} ---> fileID:{fileId}, guid:{guid}, type:{type}");
+            Lines[_index] = line;
+            return true;
+        }
+    }
+
+    private class CustomTypeGUIDCollection : FileTypeGUIDCollection
+    {
+        private readonly Dictionary<string, FileTypeGUID> _compareGUIDs = new Dictionary<string, FileTypeGUID>();
+
+        public void InitCompare(string path)
+        {
+            if (string.IsNullOrEmpty(path) || !File.Exists(path))
+            {
+                return;
+            }
+            var json = File.ReadAllText(path);
+            var guids = JsonConvert.DeserializeObject<FileTypeGUID[]>(json);
+            foreach (var item in guids)
+            {
+                _compareGUIDs[item.Guid] = item;
+            }
+        }
+
+        public override bool TryGetValue(PrefabChunk chunk, out FileTypeGUID item)
+        {
+            item = null;
+            if (string.IsNullOrEmpty(chunk.GUID))
+            {
+                return false;
+            }
+            // 丢失引用的代码块对应的应是另一个项目的guid等
+            if (_compareGUIDs.TryGetValue(chunk.GUID, out var compareItem))
+            {
+                if (chunk.Type == compareItem.FileType && chunk.FileID == compareItem.FileId)
+                {
+                    return _commonGUIDs.TryGetValue(compareItem.Type, out item);
+                }
+            }
+            return false;
+        }
+
+        public override bool IsConfusingType(PrefabChunk chunk, out FileTypeGUID[] fileTypeGUIDs)
+        {
+            fileTypeGUIDs = null;
+            return false;
+        }
+    }
+
+    private class FileTypeGUIDCollection
+    {
+        private bool _inited;
+
+        protected readonly Dictionary<Type, FileTypeGUID> _commonGUIDs = new Dictionary<Type, FileTypeGUID>();
+        protected readonly Dictionary<Type, FileTypeGUID> _confusingGUIDs = new Dictionary<Type, FileTypeGUID>();
+
+        public void Init(string path)
+        {
+            if (_inited)
+            {
+                return;
+            }
+            if (!File.Exists(path))
+            {
+                StatisticAllUGUIGUIDs();
+            }
+            var json = File.ReadAllText(path);
+            var guids = JsonConvert.DeserializeObject<FileTypeGUID[]>(json);
+            foreach (var item in guids)
+            {
+                _commonGUIDs[item.Type] = item;
+                if (item.Type == typeof(VerticalLayoutGroup) || item.Type == typeof(HorizontalLayoutGroup))
+                {
+                    _confusingGUIDs[item.Type] = item;
+                }
+            }
+            _inited = true;
+        }
+
+        public virtual bool TryGetValue(PrefabChunk chunk, out FileTypeGUID item)
+        {
+            if (chunk.ComponentType == null)
+            {
+                item = null;
+                return false;
+            }
+            return _commonGUIDs.TryGetValue(chunk.ComponentType, out item);
+        }
+
+        public virtual bool IsConfusingType(PrefabChunk chunk, out FileTypeGUID[] fileTypeGUIDs)
+        {
+            fileTypeGUIDs = null;
+            if (chunk.ComponentType == null)
+            {
+                return false;
+            }
+            if (_confusingGUIDs.ContainsKey(chunk.ComponentType))
+            {
+                fileTypeGUIDs = _confusingGUIDs.Values.ToArray();
+                return true;
+            }
+            return false;
+        }
+    }
+
+    public static void CreateDirectoryIfNotExistByFilename(string filename)
+    {
+        var folder = Path.GetDirectoryName(filename);
+        CreateDirectoryIfNotExist(folder);
+    }
+
+    public static void CreateDirectoryIfNotExist(string folder)
+    {
+        if (!Directory.Exists(folder))
+        {
+            Directory.CreateDirectory(folder);
+        }
+    }
+
+    private static void StatisticOrderedScriptGUIDs(string asmName, string fileName)
+    {
+        var g = new GameObject();
+        var asm = Assembly.Load(asmName);
+        var types = asm.GetTypes();
+        var guids = new List<FileTypeGUID>();
+        long localId;
+        string guid;
+        foreach (var type in types)
+        {
+            if (type.IsAbstract || !type.IsSubclassOf(typeof(Component)))
+            {
+                continue;
+            }
+            g.name = type.Name;
+            var component = g.AddComponent(type);
+            if (component)
+            {
+                var prefabPath = $"Assets/Editor/GUIDPrefab/{type.Name}.prefab";
+                CreateDirectoryIfNotExistByFilename(prefabPath);
+                var success = false;
+                PrefabUtility.SaveAsPrefabAsset(g, prefabPath, out success);
+                AssetDatabase.Refresh();
+                var prefab = AssetDatabase.LoadAssetAtPath(prefabPath, type);
+                if (!prefab)
+                {
+                    Debug.LogError($"type:{type} cannot load, path:{prefabPath}");
+                    continue;
+                }
+                if (AssetDatabase.TryGetGUIDAndLocalFileIdentifier(prefab, out guid, out localId))
+                {
+                    var fileId = $"&{localId}";
+                    var metaLines = File.ReadAllLines(Path.GetFullPath(prefabPath));
+                    var foundLine = false;
+                    foreach (var line in metaLines)
+                    {
+                        if (line.IndexOf(fileId) > 0)
+                        {
+                            foundLine = true;
+                            continue;
+                        }
+                        if (!foundLine)
+                        {
+                            continue;
+                        }
+                        if (line.IndexOf("m_Script:") > 0)
+                        {
+                            AnalysisScriptLine(line, out long realFileId, out string realGuid, out int fileType);
+                            guids.Add(new FileTypeGUID(type, realFileId, realGuid, fileType));
+                        }
+                    }
+                }
+                GameObject.DestroyImmediate(component);
+            }
+        }
+        GameObject.DestroyImmediate(g);
+        var json = JsonConvert.SerializeObject(guids, Formatting.Indented);
+        Debug.Log(json);
+        var path = Application.dataPath.Replace("Assets", $"{fileName}.json");
+        File.WriteAllText(path, json);
+    }
+
+    // 特征字典，根据配置块中特点返回组件类型
+    private static readonly CharacteristicInfo[] UGUICharacteristics = new CharacteristicInfo[]
+    {
+        new CharacteristicInfo("m_Text&m_FontData", typeof(Text)),
+        new CharacteristicInfo("m_InputType&m_OnEndEdit&m_OnValueChanged", typeof(InputField)),
+        new CharacteristicInfo("m_Sprite&m_FillCenter", typeof(Image)),
+        new CharacteristicInfo("m_OnCullStateChanged&m_Texture&m_UVRect", typeof(RawImage)),
+        new CharacteristicInfo("m_OnClick&m_TargetGraphic&m_SpriteState&m_Interactable", typeof(Button)),
+        new CharacteristicInfo("m_MovementType&m_Elasticity&m_Viewport&m_OnValueChanged", typeof(ScrollRect)),
+        new CharacteristicInfo("m_AnimationTriggers&m_Interactable&m_TargetGraphic&m_HandleRectm_NumberOfSteps&m_OnValueChanged", typeof(Scrollbar)),
+        new CharacteristicInfo("m_ShowMaskGraphic", typeof(Mask)),
+        new CharacteristicInfo("m_Padding&m_ChildAlignment&m_CellSize&m_Spacing", typeof(GridLayoutGroup)),
+        new CharacteristicInfo("m_Padding&m_ChildAlignment&m_Spacing&m_ChildForceExpandWidth&m_ChildForceExpandHeight&m_ChildControlWidth&m_ChildControlHeight&m_ChildScaleWidth&m_ChildScaleHeight", typeof(HorizontalLayoutGroup)),
+        new CharacteristicInfo("m_Padding&m_ChildAlignment&m_Spacing&m_ChildForceExpandWidth&m_ChildForceExpandHeight&m_ChildControlWidth&m_ChildControlHeight", typeof(VerticalLayoutGroup)),
+        new CharacteristicInfo("m_EffectColor&m_EffectDistance&m_UseGraphicAlpha", typeof(Outline)),
+        new CharacteristicInfo("m_DynamicPixelsPerUnit&m_ReferenceResolution", typeof(CanvasScaler)),
+        new CharacteristicInfo("m_IgnoreReversedGraphics&m_BlockingObjects&m_BlockingMask", typeof(GraphicRaycaster)),
+        new CharacteristicInfo("m_FirstSelected&m_DragThreshold", typeof(EventSystem)),
+        new CharacteristicInfo("m_HorizontalAxis&m_VerticalAxis&m_SubmitButton&m_CancelButton", typeof(StandaloneInputModule))
+    };
+
+    // 尝试修复引用丢失
+    [MenuItem("Assets/Try Fix UGUIComponent Missing")]
+    private static void TryFixUGUIComponentMissing()
+    {
+        var collection = new FileTypeGUIDCollection();
+        collection.Init(Application.dataPath.Replace("Assets", "uguiguids.json"));
+        FixComponentMissingBase(collection.TryGetValue, collection.IsConfusingType, UGUICharacteristics);
+    }
+
+    [MenuItem("Assets/Try Fix CustomComponent Missing")]
+    private static void TryFixCustomComponentMissing()
+    {
+        var collection = new CustomTypeGUIDCollection();
+        collection.Init(Application.dataPath.Replace("Assets", "customguids.json"));
+        collection.InitCompare(Application.dataPath.Replace("Assets", "other-customguids.json"));
+        FixComponentMissingBase(collection.TryGetValue, collection.IsConfusingType, new CharacteristicInfo[0]);
+    }
+
+    private static void FixComponentMissingBase(TryGetFileGUITypeDelegate tryGetHandler, IsConfusingTypeDelegate isConfusingTypeHandler, CharacteristicInfo[] characteristics)
+    {
+        var selected = Selection.activeGameObject;
+        if (!selected)
+        {
+            return;
+        }
+        var prefabPath = AssetDatabase.GetAssetPath(selected);
+        var lines = File.ReadAllLines(prefabPath);
+        var prefabContent = PrefabContent.Parse(selected, lines, characteristics);
+        prefabContent.Analysis(tryGetHandler, isConfusingTypeHandler);
+        lines = prefabContent.GetLines();
+        File.WriteAllLines(prefabPath, lines);
+        AssetDatabase.Refresh();
+        Debug.Log("Done");
+    }
+
+    [MenuItem("Doyo/StatisticAllUGUIGuids")]
+    private static void StatisticAllUGUIGUIDs()
+    {
+        StatisticOrderedScriptGUIDs("UnityEngine.UI", "uguiguids");
+    }
+
+
+    [MenuItem("Doyo/StatisticAllCustomGuids")]
+    private static void StatisticAllCustomGUIDs()
+    {
+        StatisticOrderedScriptGUIDs("Assembly-CSharp", "customguids");
+    }
+
+    private static void AnalysisScriptLine(string line, out long fileId, out string guid, out int type)
+    {
+        fileId = 0;
+        guid = string.Empty;
+        type = 0;
+        if (!line.Trim().StartsWith("m_Script:"))
+        {
+            return;
+        }
+        var index = line.IndexOf("{");
+        var endIndex = line.LastIndexOf("}");
+        var inside = line.Substring(index + 1, endIndex - index - 1);
+        var arr = inside.Split(',');
+        foreach (var item in arr)
+        {
+            var pair = item.Split(':');
+            switch (pair[0].Trim())
+            {
+                case "fileID":
+                    long.TryParse(pair[1].Trim(), out fileId);
+                    break;
+                case "guid":
+                    guid = pair[1].Trim();
+                    break;
+                case "type":
+                    int.TryParse(pair[1].Trim(), out type);
+                    break;
+            }
+        }
+    }
+}
